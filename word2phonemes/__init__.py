@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import itertools
+import logging
 
 from .model import WordToPhonemeModel
 
@@ -17,12 +18,24 @@ def main():
                         help='Split words into groups of N syllables first (N=0 is disabled)')
     parser.add_argument('--syllable-language', type=str, default=None,
                         help='Language to use for syllable splitting (default=auto)')
+    parser.add_argument('--train', type=int, default=0,
+                        help='Train for N epochs')
 
     args = parser.parse_args()
+    model_dir = os.path.join(args.data_dir, args.language)
 
     # -------------------------------------------------------------------------
 
-    model_dir = os.path.join(args.data_dir, args.language)
+    if args.train > 0:
+        logging.basicConfig(level=logging.DEBUG)
+
+        model = WordToPhonemeModel()
+        model.load_dataset(os.path.join(model_dir, 'dictionary.csv'))
+        model.train(args.train, os.path.join(model_dir, 'g2p-model.pt'))
+        sys.exit(0)
+
+    # -------------------------------------------------------------------------
+
     model = WordToPhonemeModel(model_dir)
 
     words = args.words if len(args.words) > 0 else sys.stdin
