@@ -3,6 +3,7 @@ import os
 import re
 import random
 import logging
+import math
 from collections import Counter
 
 import torch
@@ -12,19 +13,22 @@ from torchtext.data import Field, TabularDataset, BucketIterator
 from torchtext.vocab import Vocab
 
 class WordToPhonemeModel:
+    '''Contains pytorch model for converting words to phonemes.'''
+
     UNK_TOKEN = '<unk>'
     PAD_TOKEN = '<pad>'
     SOS_TOKEN = '<sos>'
     EOS_TOKEN = '<eos>'
 
-    def __init__(self, model_dir=None, **load_kwargs):
+    def __init__(self, model_dir=None, device=None, **load_kwargs):
         self._logger = logging.getLogger(__class__.__name__)
-        self.best_lost = float('inf')
+        self.device = device
+        self.best_test_loss = float('inf')
 
         if model_dir is not None:
             self.load_model(model_dir, **load_kwargs)
 
-    def word2phonemes(self, word, lower=True, device='cpu'):
+    def word2phonemes(self, word:str, lower:bool=True):
         if lower:
             word = word.lower()
 
@@ -32,7 +36,7 @@ class WordToPhonemeModel:
         tokenized = [WordToPhonemeModel.SOS_TOKEN] + tokenized + [WordToPhonemeModel.EOS_TOKEN]
         numericalized = [self.src_field.vocab.stoi[t] for t in tokenized]
 
-        src = torch.LongTensor(numericalized).unsqueeze(1).to(device)
+        src = torch.LongTensor(numericalized).unsqueeze(1).to(self.device)
         self.model.eval()
         output = self.model(src, None, teacher_forcing_ratio=0)[1:]
 
@@ -44,7 +48,8 @@ class WordToPhonemeModel:
 
     # -------------------------------------------------------------------------
 
-    def load_dataset(self, csv_path, lower=True, device='cpu'):
+    def load_dataset(self, csv_path:str, lower=True) -> None:
+        '''Loads a CSV dataset of the form WORD,PH ON EM ES'''
         self.src_field = Field(tokenize=WordToPhonemeModel.tokenize_word,
                                init_token=WordToPhonemeModel.SOS_TOKEN,
                                eos_token=WordToPhonemeModel.EOS_TOKEN,
@@ -55,41 +60,84 @@ class WordToPhonemeModel:
                                eos_token=WordToPhonemeModel.EOS_TOKEN,
                                lower=lower)
 
+        self._logger.debug(f'Loading dataset from {csv_path}')
         self.dataset = TabularDataset(path=csv_path, format='csv',
                                       fields=[('src', self.src_field), ('trg', self.trg_field)])
 
         self.train_data, self.test_data = self.dataset.split()
+        self._logger.debug(f'Training examples: {len(self.train_data)}')
+        self._logger.debug(f'Testing examples: {len(self.test_data)}')
 
+        self._logger.debug(f'Building vocabulary from {len(self.train_data)} example(s)')
         self.src_field.build_vocab(self.train_data, min_freq=1)
         self.trg_field.build_vocab(self.train_data, min_freq=1)
 
-        self.model = self._make_model(device=device)
+        self.model = self._make_model()
+        self._logger.debug(self.model)
 
-    def train(self, epochs, save_path, clip=10, batch_size=128, device='cpu'):
+    # -------------------------------------------------------------------------
+
+    def save_vocabulary(self, model_dir):
+        # Source
+        with open(os.path.join(model_dir, 'src-vocab.txt'), 'w') as src_vocab_file:
+            for symbol in self.src_field.vocab.itos:
+                print(symbol, file=src_vocab_file)
+
+        with open(os.path.join(model_dir, 'src-freqs.txt'), 'w') as src_freq_file:
+            for symbol, count in self.src_field.vocab.freqs.items():
+                print(symbol, count, file=src_freq_file)
+
+        # Target
+        with open(os.path.join(model_dir, 'trg-vocab.txt'), 'w') as trg_vocab_file:
+            for symbol in self.trg_field.vocab.itos:
+                print(symbol, file=trg_vocab_file)
+
+        with open(os.path.join(model_dir, 'trg-freqs.txt'), 'w') as trg_freq_file:
+            for symbol, count in self.trg_field.vocab.freqs.items():
+                print(symbol, count, file=trg_freq_file)
+
+        self._logger.debug(f'Saved vocabulary to {model_dir}')
+
+    # -------------------------------------------------------------------------
+
+    def train(self, epochs, save_path, load_previous=True, clip=10, batch_size=128):
+        save_dir = os.path.split(save_path)[0]
+        os.makedirs(save_dir, exist_ok=True)
+
+        if load_previous and os.path.exists(save_path):
+            self._logger.debug(f'Loading model state from {save_path}')
+            self.model.load_state_dict(torch.load(save_path))
+
         train_iterator, test_iterator = BucketIterator.splits(
-            (self.train_data, self.test_data), batch_size=batch_size, device=device,
+            (self.train_data, self.test_data), batch_size=batch_size, device=self.device,
             sort_key=lambda x: len(x.src))
 
         optimizer = optim.Adam(self.model.parameters())
         trg_pad_idx = self.trg_field.vocab.stoi[WordToPhonemeModel.PAD_TOKEN]
         criterion = nn.CrossEntropyLoss(ignore_index=trg_pad_idx)
 
+        # Training loop
+        self._logger.debug(f'Beginning training for {epochs} epoch(s)')
         for epoch in range(epochs):
             train_loss = self._train_iter(train_iterator, optimizer, criterion, clip)
             test_loss = self._evaluate_iter(test_iterator, criterion)
 
             if test_loss < self.best_test_loss:
+                # Save model if better
                 self.best_test_loss = test_loss
-                os.makedirs(save_path, exist_ok=True)
                 torch.save(self.model.state_dict(), save_path)
 
             self._logger.debug(f'| Epoch: {epoch+1:03} | Train Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f} | Test Loss: {test_loss:.3f} | Test PPL: {math.exp(test_loss):7.3f} |')
 
-        os.makedirs(save_path, exist_ok=True)
+        # Save model
         torch.save(self.model.state_dict(), save_path)
         self._logger.info(save_path)
 
-    def _train_iter(self, iterator, optimizer, criterion, clip):
+        return self.best_test_loss
+
+    # -------------------------------------------------------------------------
+
+    def _train_iter(self, iterator, optimizer, criterion, clip) -> float:
         self.model.train()
         epoch_loss = 0
         for i, batch in enumerate(iterator):
@@ -135,7 +183,8 @@ class WordToPhonemeModel:
 
     # -------------------------------------------------------------------------
 
-    def load_model(self, model_dir, lower=True, device='cpu', no_state=False):
+    def load_model(self, model_dir, lower=True, no_state=False):
+        self._logger.debug(f'Loading vocabulary files from {model_dir}')
         self.src_field = Field(tokenize=WordToPhonemeModel.tokenize_word,
                                init_token=WordToPhonemeModel.SOS_TOKEN,
                                eos_token=WordToPhonemeModel.EOS_TOKEN,
@@ -152,14 +201,20 @@ class WordToPhonemeModel:
         self.trg_field.vocab = WordToPhonemeModel.load_vocab(
             os.path.join(model_dir, 'trg-freqs.txt'))
 
-        self.model = self._make_model(device=device)
+        self.model = self._make_model()
+        self._logger.debug(self.model)
 
         if not no_state:
             state_path = os.path.join(model_dir, 'g2p-model.pt')
             if os.path.exists(state_path):
+                self._logger.debug(f'Loading model state from {state_path}')
                 self.model.load_state_dict(torch.load(state_path))
+            else:
+                self._logger.warning(f'Missing model state file at {state_path}!')
 
-    def _make_model(self, device='cpu'):
+    # -------------------------------------------------------------------------
+
+    def _make_model(self):
         input_dim = len(self.src_field.vocab)
         output_dim = len(self.trg_field.vocab)
         enc_emb_dim = 256
@@ -175,7 +230,9 @@ class WordToPhonemeModel:
         enc = Encoder(input_dim, enc_emb_dim, hid_dim, enc_dropout)
         dec = Decoder(output_dim, dec_emb_dim, hid_dim, dec_dropout)
 
-        return Seq2Seq(enc, dec, self.pad_idx, self.sos_idx, self.eos_idx, device)
+        return Seq2Seq(enc, dec, self.pad_idx, self.sos_idx, self.eos_idx, self.device)
+
+    # -------------------------------------------------------------------------
 
     @classmethod
     def tokenize_word(cls, word):
